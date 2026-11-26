@@ -1,0 +1,87 @@
+name: Fernwell CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend:
+    name: Backend check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # there are no tests yet, so check that every file is valid JavaScript
+      - name: Syntax check
+        run: |
+          node --check index.js
+          node --check seed.js
+          find src -name "*.js" -print0 | xargs -0 -n1 node --check
+
+  frontend:
+    name: Frontend lint and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+        env:
+          # the address of your deployed backend (add it in Settings > Secrets and variables > Actions > Variables)
+          VITE_API_URL: ${{ vars.VITE_API_URL }}
+
+      - name: Save the build
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+  # runs only on pushes to main, and only after both checks pass
+  deploy:
+    name: Deploy
+    needs: [backend, frontend]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      # works with Render. Create the "deploy hook" URLs in Render and save them as repository secrets.
+      # If a secret is empty, that step is skipped.
+      - name: Trigger backend deploy
+        env:
+          HOOK: ${{ secrets.RENDER_BACKEND_DEPLOY_HOOK }}
+        run: |
+          if [ -n "$HOOK" ]; then curl -fsS -X POST "$HOOK"; else echo "RENDER_BACKEND_DEPLOY_HOOK not set, skipping"; fi
+
+      - name: Trigger frontend deploy
+        env:
+          HOOK: ${{ secrets.RENDER_FRONTEND_DEPLOY_HOOK }}
+        run: |
+          if [ -n "$HOOK" ]; then curl -fsS -X POST "$HOOK"; else echo "RENDER_FRONTEND_DEPLOY_HOOK not set, skipping"; fi
