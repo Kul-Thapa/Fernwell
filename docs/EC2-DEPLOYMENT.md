@@ -38,7 +38,7 @@ Only the three AWS credentials are kept in GitHub Secrets. Everything else is re
 | `AWS_REGION` | `us-east-2` | Region of your sandbox (the provided session token indicates `us-east-2`) |
 | `STACK_NAME` | `fernwell-stack` | CloudFormation stack name |
 | `ADMIN_EMAIL` | `admin@fernwell.com` | Email of the first admin user |
-| `DB_URL` | `mongodb+srv://user:pass@cluster.mongodb.net/fernwell` | MongoDB connection string |
+| `DB_URL` | `mongodb://127.0.0.1:27017/fernwell` | MongoDB connection string (MongoDB is installed on the EC2 instance by the template) |
 | `JWT_SECRET` | output of `openssl rand -hex 32` | Signs login tokens |
 | `ADMIN_PASSWORD` | your chosen password | Password for the first admin user |
 
@@ -48,7 +48,7 @@ Notes:
 
 - AWS Academy sandbox keys are temporary: the access key, secret key, and session token all change together. Start the sandbox and update all three GitHub Secrets together before deploying again. If you paste credentials somewhere public (chat, screenshot, commit), rotate them in the sandbox immediately.
 - `DB_URL`, `JWT_SECRET` and `ADMIN_PASSWORD` are also sensitive. Keeping them in a committed file means anyone with repository access can read them. GitHub Secrets are the safer place; if you change your mind, add those three as secrets and restore the `${{ secrets.NAME }}` references in `.github/workflows/deploy-ec2.yml`.
-- If MongoDB Atlas is used, add the runner's IP to Atlas Network Access (or allow `0.0.0.0/0` for a student project).
+- The template installs MongoDB Community Edition on the instance, so the default `mongodb://127.0.0.1:27017/fernwell` works without Atlas. If you switch to Atlas, add the runner's IP to Atlas Network Access (or allow `0.0.0.0/0` for a student project) and update `DB_URL`.
 - The AWS credentials are never written to the repository or the instance.
 
 ## 2. Trigger the pipeline

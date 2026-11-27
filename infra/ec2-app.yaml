@@ -59,6 +59,18 @@ Resources:
           # nginx serves React; node/npm run the Express API. Build tools let bcrypt install on this instance.
           dnf install -y nginx nodejs npm gcc-c++ make python3
 
+          # The project uses mongodb://127.0.0.1:27017/fernwell, so run MongoDB on this instance too.
+          cat > /etc/yum.repos.d/mongodb-org-8.0.repo <<'MONGO'
+          [mongodb-org-8.0]
+          name=MongoDB Repository
+          baseurl=https://repo.mongodb.org/yum/amazon/2023/mongodb-org/8.0/x86_64/
+          gpgcheck=1
+          enabled=1
+          gpgkey=https://pgp.mongodb.com/server-8.0.asc
+          MONGO
+          dnf install -y mongodb-org
+          systemctl enable --now mongod
+
           mkdir -p /opt/fernwell/backend
           chown -R ec2-user:ec2-user /opt/fernwell /usr/share/nginx/html
 
@@ -112,8 +124,8 @@ Resources:
           cat > /etc/systemd/system/fernwell-api.service <<'SERVICE'
           [Unit]
           Description=Fernwell Express API
-          After=network-online.target
-          Wants=network-online.target
+          After=network-online.target mongod.service
+          Wants=network-online.target mongod.service
 
           [Service]
           Type=simple
