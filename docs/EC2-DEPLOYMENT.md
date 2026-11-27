@@ -116,6 +116,8 @@ curl http://localhost/api/             # should return {"success":true,...}
 
 Change app settings by editing `.github/deploy-config.env` and pushing. Change AWS credentials by updating the three GitHub Secrets. The `.env` on the instance is rewritten on every deploy.
 
+Repeat deploys are quick: server setup runs once, `node_modules` stays on the instance (so `npm ci` only runs when `backend/package-lock.json` changes), and seeding is skipped when `DB_URL` is unchanged.
+
 ## 7. Troubleshooting
 
 | Symptom | Fix |

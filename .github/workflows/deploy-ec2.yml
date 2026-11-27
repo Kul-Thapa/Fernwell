@@ -176,24 +176,36 @@ jobs:
         env:
           IP: ${{ steps.instance.outputs.ip }}
         run: |
+          DEPS_HASH=$(sha256sum backend/package-lock.json | cut -d' ' -f1)
           tar -czf backend.tar.gz --exclude=node_modules --exclude=.env -C backend .
           tar -czf frontend.tar.gz -C frontend/dist .
           scp $SSH_OPTS backend.tar.gz frontend.tar.gz ec2-user@"$IP":/tmp/
           ssh $SSH_OPTS ec2-user@"$IP" "
             set -e
             mkdir -p $APP_DIR $SITE_DIR
-            rm -rf $APP_DIR/* $SITE_DIR/*
+            # Keep node_modules and marker files on the instance so repeat deploys are fast.
+            find $APP_DIR -mindepth 1 -maxdepth 1 ! -name node_modules ! -name .env ! -name .deps-sha256 ! -name .seeded -exec rm -rf {} +
+            rm -rf $SITE_DIR/*
             tar -xzf /tmp/backend.tar.gz -C $APP_DIR
             tar -xzf /tmp/frontend.tar.gz -C $SITE_DIR
             rm -f /tmp/backend.tar.gz /tmp/frontend.tar.gz
             cd $APP_DIR
-            npm ci --omit=dev
+            CURRENT_HASH=''
+            if [ -f .deps-sha256 ]; then CURRENT_HASH=\$(cat .deps-sha256); fi
+            if [ '$DEPS_HASH' != \"\$CURRENT_HASH\" ] || [ ! -d node_modules ]; then
+              echo 'Installing backend dependencies (package-lock changed)...'
+              npm ci --omit=dev
+              printf '%s' '$DEPS_HASH' > .deps-sha256
+            else
+              echo 'Backend dependencies unchanged, skipping npm ci.'
+            fi
           "
 
       - name: Configure backend environment and seed database
         env:
           IP: ${{ steps.instance.outputs.ip }}
         run: |
+          DB_HASH=$(printf '%s' "$DB_URL" | sha256sum | cut -d' ' -f1)
           {
             printf 'PORT=8000\n'
             printf 'DB_URL=%s\n' "$DB_URL"
@@ -208,7 +220,15 @@ jobs:
             install -m 600 /tmp/fernwell.env $APP_DIR/.env
             rm -f /tmp/fernwell.env
             cd $APP_DIR
-            npm run seed
+            CURRENT_DB_HASH=''
+            if [ -f .seeded ]; then CURRENT_DB_HASH=\$(cat .seeded); fi
+            if [ '$DB_HASH' = \"\$CURRENT_DB_HASH\" ]; then
+              echo 'Database already seeded for this DB_URL, skipping.'
+            else
+              echo 'Seeding database...'
+              npm run seed
+              printf '%s' '$DB_HASH' > .seeded
+            fi
           "
           rm -f backend.env
 
