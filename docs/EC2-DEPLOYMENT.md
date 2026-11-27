@@ -99,6 +99,7 @@ Change instance size: run the workflow manually and pick a different `instance_t
 
 | Symptom | Fix |
 | --- | --- |
+| `Invalid character in header content ["x-amz-security-token"]` | The session token secret contained a hidden newline. The workflow now trims all three AWS secrets automatically; if it still happens, re-create the secret with a single-line paste. |
 | `SignatureDoesNotMatch` / `InvalidClientTokenId` | AWS keys are swapped, have spaces, expired, or the matching `AWS_SESSION_TOKEN` is missing. Copy all three fresh sandbox values together. |
 | Workflow stops at "Check AWS secrets and deploy config" | Fill in the `replace-...` values in `.github/deploy-config.env`, or add the missing AWS secret, then run the workflow again. |
 | `SSH not ready yet ...` for the full loop | Check the security group allows port 22 from GitHub runners, and that the keys belong to the same sandbox account/region. |
