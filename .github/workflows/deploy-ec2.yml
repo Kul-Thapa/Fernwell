@@ -1,0 +1,233 @@
+name: Deploy MERN app to EC2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - "infra/**"
+      - ".github/deploy-config.env"
+      - ".github/workflows/deploy-ec2.yml"
+  workflow_dispatch:
+    inputs:
+      instance_type:
+        description: EC2 instance type
+        default: t2.micro
+        type: choice
+        options: [t2.micro, t2.small, t2.medium, t3.micro, t3.small, t3.medium]
+
+concurrency:
+  group: fernwell-ec2-deploy
+  cancel-in-progress: false
+
+env:
+  # Region, stack name, MongoDB URL and admin settings come from .github/deploy-config.env
+  TEMPLATE: infra/ec2-app.yaml
+  SITE_DIR: /usr/share/nginx/html
+  APP_DIR: /opt/fernwell/backend
+  SSH_OPTS: -i ec2-key.pem -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o LogLevel=ERROR
+
+jobs:
+  build:
+    name: Build React app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+        env:
+          # nginx proxies /api to the Express API, so no public backend URL is baked into the build.
+          VITE_API_URL: /api
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 7
+
+  deploy:
+    name: Deploy EC2 stack and app
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load project deploy config
+        run: |
+          # KEY=value lines from the committed config become env vars for later steps.
+          while IFS='=' read -r key value; do
+            case "$key" in ""|\#*) continue ;; esac
+            printf '%s=%s\n' "$key" "$value" >> "$GITHUB_ENV"
+          done < .github/deploy-config.env
+
+      - name: Check AWS secrets and deploy config
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+        run: |
+          missing=0
+          if [[ "$AWS_ACCESS_KEY_ID" == ASIA* ]] && [ -z "$AWS_SESSION_TOKEN" ]; then
+            echo "::error::Your AWS keys are temporary (ASIA...). Add the matching AWS_SESSION_TOKEN secret."
+            missing=1
+          fi
+          for key in AWS_REGION STACK_NAME DB_URL JWT_SECRET ADMIN_PASSWORD; do
+            value="${!key:-}"
+            case "$value" in
+              ""|replace-*)
+                echo "::error::$key is missing or still a placeholder. Edit .github/deploy-config.env."
+                missing=1
+                ;;
+            esac
+          done
+          if [ "$missing" -ne 0 ]; then exit 1; fi
+          echo "AWS secrets and project config are ready."
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate CloudFormation template
+        run: aws cloudformation validate-template --template-body file://${{ env.TEMPLATE }}
+
+      - name: Deploy stack
+        run: |
+          args=(
+            --stack-name "$STACK_NAME"
+            --template-file "$TEMPLATE"
+            --parameter-overrides InstanceType="${{ inputs.instance_type || 't2.micro' }}"
+            --no-fail-on-empty-changeset
+          )
+          aws cloudformation deploy "${args[@]}"
+
+      - name: Find instance and current public IP
+        id: instance
+        run: |
+          output() { aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+          INSTANCE_ID=$(output InstanceId)
+          KEY_ID=$(output KeyPairId)
+
+          STATE=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].State.Name" --output text)
+          echo "Instance $INSTANCE_ID is $STATE"
+          if [ "$STATE" = "stopping" ]; then aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"; STATE=stopped; fi
+          if [ "$STATE" = "stopped" ]; then aws ec2 start-instances --instance-ids "$INSTANCE_ID" > /dev/null; fi
+          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+
+          IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+          echo "ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "key_id=$KEY_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Get SSH key from SSM
+        run: |
+          aws ssm get-parameter --name "/ec2/keypair/${{ steps.instance.outputs.key_id }}" --with-decryption --query Parameter.Value --output text > ec2-key.pem
+          chmod 600 ec2-key.pem
+
+      - name: Wait for SSH and first-boot setup
+        env:
+          IP: ${{ steps.instance.outputs.ip }}
+        run: |
+          for i in $(seq 1 30); do
+            ssh $SSH_OPTS ec2-user@"$IP" true && break
+            echo "SSH not ready yet ($i/30), retrying in 10s..."
+            sleep 10
+          done
+          status=0
+          ssh $SSH_OPTS ec2-user@"$IP" 'cloud-init status --wait' || status=$?
+          if [ "$status" -eq 1 ]; then
+            echo "::error::UserData failed on the instance. Last lines of its log:"
+            ssh $SSH_OPTS ec2-user@"$IP" 'sudo tail -n 40 /var/log/cloud-init-output.log' || true
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+      - name: Upload app files and install backend packages
+        env:
+          IP: ${{ steps.instance.outputs.ip }}
+        run: |
+          tar -czf backend.tar.gz --exclude=node_modules --exclude=.env -C backend .
+          tar -czf frontend.tar.gz -C frontend/dist .
+          scp $SSH_OPTS backend.tar.gz frontend.tar.gz ec2-user@"$IP":/tmp/
+          ssh $SSH_OPTS ec2-user@"$IP" "
+            set -e
+            mkdir -p $APP_DIR $SITE_DIR
+            rm -rf $APP_DIR/* $SITE_DIR/*
+            tar -xzf /tmp/backend.tar.gz -C $APP_DIR
+            tar -xzf /tmp/frontend.tar.gz -C $SITE_DIR
+            rm -f /tmp/backend.tar.gz /tmp/frontend.tar.gz
+            cd $APP_DIR
+            npm ci --omit=dev
+          "
+
+      - name: Configure backend environment and seed database
+        env:
+          IP: ${{ steps.instance.outputs.ip }}
+        run: |
+          {
+            printf 'PORT=8000\n'
+            printf 'DB_URL=%s\n' "$DB_URL"
+            printf 'JWT_SECRET=%s\n' "$JWT_SECRET"
+            printf 'CLIENT_URL=http://%s\n' "$IP"
+            printf 'ADMIN_EMAIL=%s\n' "$ADMIN_EMAIL"
+            printf 'ADMIN_PASSWORD=%s\n' "$ADMIN_PASSWORD"
+          } > backend.env
+          scp $SSH_OPTS backend.env ec2-user@"$IP":/tmp/fernwell.env
+          ssh $SSH_OPTS ec2-user@"$IP" "
+            set -e
+            install -m 600 /tmp/fernwell.env $APP_DIR/.env
+            rm -f /tmp/fernwell.env
+            cd $APP_DIR
+            npm run seed
+          "
+          rm -f backend.env
+
+      - name: Restart API service
+        env:
+          IP: ${{ steps.instance.outputs.ip }}
+        run: ssh $SSH_OPTS ec2-user@"$IP" 'sudo systemctl restart fernwell-api && sudo systemctl enable fernwell-api'
+
+      - name: Check the app is live
+        env:
+          IP: ${{ steps.instance.outputs.ip }}
+        run: |
+          if ! curl -fsS --retry 10 --retry-delay 3 "http://$IP/" | grep -q 'id="root"'; then
+            echo "::error::Frontend did not respond. Recent nginx errors:"
+            ssh $SSH_OPTS ec2-user@"$IP" 'sudo tail -n 40 /var/log/nginx/error.log' || true
+            exit 1
+          fi
+          if ! curl -fsS --retry 10 --retry-delay 3 "http://$IP/api/" | grep -q '"success":true'; then
+            echo "::error::API did not respond through /api. Recent API logs:"
+            ssh $SSH_OPTS ec2-user@"$IP" 'sudo journalctl -u fernwell-api -n 50 --no-pager' || true
+            exit 1
+          fi
+
+      - name: Show outputs
+        env:
+          IP: ${{ steps.instance.outputs.ip }}
+        run: |
+          echo "### Fernwell is live at http://$IP" >> "$GITHUB_STEP_SUMMARY"
+          echo "API: http://$IP/api" >> "$GITHUB_STEP_SUMMARY"
+          aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs" --output table | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove SSH key
+        if: always()
+        run: rm -f ec2-key.pem backend.env

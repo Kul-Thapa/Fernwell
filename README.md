@@ -8,6 +8,10 @@ fernwell/
   frontend/   React website -> http://localhost:5173
 ```
 
+## Deploy to EC2 with GitHub Actions
+
+A second workflow builds the site and deploys the whole MERN app (React + Express) to one AWS EC2 instance using CloudFormation. Only the three AWS credentials go in GitHub Secrets; MongoDB URL, JWT secret and admin settings are filled in `.github/deploy-config.env`. Then push to `main` or run **Deploy MERN app to EC2** manually. See [docs/EC2-DEPLOYMENT.md](docs/EC2-DEPLOYMENT.md) for the full setup. The existing CI checks and local development are unchanged.
+
 ## 1. Install the tools (one time)
 
 1. **Node.js LTS** (v20 or newer): https://nodejs.org  
