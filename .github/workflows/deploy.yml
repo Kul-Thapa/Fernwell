@@ -1,0 +1,44 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  # Change this to the public IP of your EC2 instance.
+  EC2_HOST: replace-with-your-ec2-public-ip
+  EC2_USER: ec2-user
+
+jobs:
+  deploy:
+    name: Deploy over SSH
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check setup
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          if [[ "$EC2_HOST" == replace-* || -z "$EC2_HOST" ]]; then
+            echo "::error::Set EC2_HOST in this workflow file to your instance's public IP."
+            exit 1
+          fi
+          if [ -z "$EC2_SSH_KEY" ]; then
+            echo "::error::Add EC2_SSH_KEY to Settings > Secrets and variables > Actions > Secrets."
+            exit 1
+          fi
+
+      - name: Write SSH key
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s' "$EC2_SSH_KEY" \
+            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' > ~/.ssh/id_rsa
+          printf '\n' >> ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Deploy
+        run: |
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
+            "$EC2_USER@$EC2_HOST" 'cd /opt/fernwell && bash deploy/update.sh'

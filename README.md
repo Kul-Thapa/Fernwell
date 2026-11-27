@@ -10,7 +10,7 @@ fernwell/
 
 ## Deploy to EC2 with GitHub Actions
 
-A second workflow builds the site and deploys the whole MERN app (React + Express) to one AWS EC2 instance. Only the three AWS credentials go in GitHub Secrets; the instance ID, MongoDB URL, JWT secret and admin settings are filled in `.github/deploy-config.env`. Then push to `main` or run **Deploy MERN app to EC2** manually. See [docs/EC2-DEPLOYMENT.md](docs/EC2-DEPLOYMENT.md) for the one-time instance setup and full details. The existing CI checks and local development are unchanged.
+A second workflow deploys the whole MERN app (React + Express) to one EC2 instance. Create the instance once using [`deploy/setup-server.sh`](deploy/setup-server.sh), add the `EC2_SSH_KEY` GitHub Secret, set the IP in `.github/workflows/deploy.yml`, then push to `main` or run **Deploy to EC2** manually. See [docs/EC2-SETUP.md](docs/EC2-SETUP.md). No CloudFormation or AWS credentials are needed. The existing CI checks and local development are unchanged.
 
 ## 1. Install the tools (one time)
 
