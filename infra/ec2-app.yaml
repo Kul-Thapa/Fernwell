@@ -1,4 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
+# NOTE: kept as a reference only. The AWS Academy sandbox denies CloudFormation via an SCP,
+# so .github/workflows/deploy-ec2.yml deploys directly to an existing EC2 instance instead.
 Description: Fernwell MERN app on one Amazon Linux 2023 EC2 instance. nginx serves the React build and proxies /api to the Express API.
 
 Parameters:

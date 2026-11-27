@@ -6,24 +6,17 @@ on:
     paths:
       - "backend/**"
       - "frontend/**"
-      - "infra/**"
+      - "scripts/**"
       - ".github/deploy-config.env"
       - ".github/workflows/deploy-ec2.yml"
   workflow_dispatch:
-    inputs:
-      instance_type:
-        description: EC2 instance type
-        default: t2.micro
-        type: choice
-        options: [t2.micro, t2.small, t2.medium, t3.micro, t3.small, t3.medium]
 
 concurrency:
   group: fernwell-ec2-deploy
   cancel-in-progress: false
 
 env:
-  # Region, stack name, MongoDB URL and admin settings come from .github/deploy-config.env
-  TEMPLATE: infra/ec2-app.yaml
+  # Instance ID, region, MongoDB URL and admin settings come from .github/deploy-config.env
   SITE_DIR: /usr/share/nginx/html
   APP_DIR: /opt/fernwell/backend
   SSH_OPTS: -i ec2-key.pem -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o LogLevel=ERROR
@@ -59,7 +52,7 @@ jobs:
           retention-days: 7
 
   deploy:
-    name: Deploy EC2 stack and app
+    name: Deploy app to EC2 instance
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -97,7 +90,7 @@ jobs:
             echo "::error::Your AWS keys are temporary (ASIA...). Add the matching AWS_SESSION_TOKEN secret."
             missing=1
           fi
-          for key in AWS_REGION STACK_NAME DB_URL JWT_SECRET ADMIN_PASSWORD; do
+          for key in AWS_REGION INSTANCE_ID SSH_KEY_PARAM DB_URL JWT_SECRET ADMIN_PASSWORD; do
             value="${!key:-}"
             case "$value" in
               ""|replace-*)
@@ -117,26 +110,9 @@ jobs:
           aws-session-token: ${{ env.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Validate CloudFormation template
-        run: aws cloudformation validate-template --template-body file://${{ env.TEMPLATE }}
-
-      - name: Deploy stack
-        run: |
-          args=(
-            --stack-name "$STACK_NAME"
-            --template-file "$TEMPLATE"
-            --parameter-overrides InstanceType="${{ inputs.instance_type || 't2.micro' }}"
-            --no-fail-on-empty-changeset
-          )
-          aws cloudformation deploy "${args[@]}"
-
       - name: Find instance and current public IP
         id: instance
         run: |
-          output() { aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
-          INSTANCE_ID=$(output InstanceId)
-          KEY_ID=$(output KeyPairId)
-
           STATE=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].State.Name" --output text)
           echo "Instance $INSTANCE_ID is $STATE"
           if [ "$STATE" = "stopping" ]; then aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"; STATE=stopped; fi
@@ -144,30 +120,52 @@ jobs:
           aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
 
           IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+          if [ -z "$IP" ] || [ "$IP" = "None" ]; then
+            echo "::error::Instance has no public IP. Check that it is in a public subnet."
+            exit 1
+          fi
           echo "ip=$IP" >> "$GITHUB_OUTPUT"
-          echo "key_id=$KEY_ID" >> "$GITHUB_OUTPUT"
 
       - name: Get SSH key from SSM
         run: |
-          aws ssm get-parameter --name "/ec2/keypair/${{ steps.instance.outputs.key_id }}" --with-decryption --query Parameter.Value --output text > ec2-key.pem
+          aws ssm get-parameter --name "$SSH_KEY_PARAM" --with-decryption --query Parameter.Value --output text > ec2-key.pem
+          if ! grep -q -- "-----BEGIN" ec2-key.pem; then
+            echo "::error::The SSM parameter does not contain a valid private key."
+            exit 1
+          fi
           chmod 600 ec2-key.pem
 
-      - name: Wait for SSH and first-boot setup
+      - name: Wait for SSH
         env:
           IP: ${{ steps.instance.outputs.ip }}
         run: |
+          ready=0
           for i in $(seq 1 30); do
-            ssh $SSH_OPTS ec2-user@"$IP" true && break
+            if ssh $SSH_OPTS ec2-user@"$IP" true; then ready=1; break; fi
             echo "SSH not ready yet ($i/30), retrying in 10s..."
             sleep 10
           done
-          status=0
-          ssh $SSH_OPTS ec2-user@"$IP" 'cloud-init status --wait' || status=$?
-          if [ "$status" -eq 1 ]; then
-            echo "::error::UserData failed on the instance. Last lines of its log:"
-            ssh $SSH_OPTS ec2-user@"$IP" 'sudo tail -n 40 /var/log/cloud-init-output.log' || true
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::Could not connect over SSH. Check the key in SSM and the security group (port 22)."
             exit 1
           fi
+
+      - name: Bootstrap instance on first deploy
+        env:
+          IP: ${{ steps.instance.outputs.ip }}
+        run: |
+          scp $SSH_OPTS scripts/ec2-bootstrap.sh ec2-user@"$IP":/tmp/ec2-bootstrap.sh
+          ssh $SSH_OPTS ec2-user@"$IP" "
+            set -e
+            if [ ! -f /opt/fernwell/.bootstrapped ]; then
+              echo 'Running one-time server setup...'
+              sudo bash /tmp/ec2-bootstrap.sh
+              sudo touch /opt/fernwell/.bootstrapped
+            else
+              echo 'Server already set up, skipping bootstrap.'
+            fi
+            rm -f /tmp/ec2-bootstrap.sh
+          "
 
       - uses: actions/download-artifact@v4
         with:
@@ -240,7 +238,7 @@ jobs:
         run: |
           echo "### Fernwell is live at http://$IP" >> "$GITHUB_STEP_SUMMARY"
           echo "API: http://$IP/api" >> "$GITHUB_STEP_SUMMARY"
-          aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs" --output table | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Instance: $INSTANCE_ID (region $AWS_REGION)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove SSH key
         if: always()

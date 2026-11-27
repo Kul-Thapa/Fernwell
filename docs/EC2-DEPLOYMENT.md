@@ -1,114 +1,133 @@
-# Deploy Fernwell to EC2 (GitHub Actions + CloudFormation)
+# Deploy Fernwell to EC2 (GitHub Actions, no CloudFormation)
 
-This pipeline is the same shape as the AWS student-lab example: **build on GitHub, create one EC2 instance with CloudFormation, then copy the app over SSH**. It is adapted for a MERN app, so the Express API runs on the instance too.
+Your AWS Academy sandbox has a service control policy that **explicitly denies CloudFormation**, including `cloudformation:ValidateTemplate`. The original CloudFormation-based pipeline therefore cannot run there. This version deploys directly to an EC2 instance you create once.
 
 ```
 push to main (or Run workflow)
    │
    ├─ build job ── npm ci → npm run build (VITE_API_URL=/api) → frontend/dist artifact
    │
-   └─ deploy job ─ CloudFormation (EC2 + nginx + Node, created once)
-                  → get SSH key from SSM
-                  → start the instance if the sandbox stopped it, read the current IP
-                  → copy React dist/ to nginx and backend/ to /opt/fernwell/backend
+   └─ deploy job ─ read .github/deploy-config.env
+                  → start the instance if it was stopped, read the current public IP
+                  → fetch the SSH private key from SSM Parameter Store
+                  → one-time bootstrap: install nginx, Node.js, MongoDB, systemd service
+                  → copy React dist/ and backend/ to the instance
                   → npm ci on the instance, write .env from project config, npm run seed
                   → restart fernwell-api, check website and /api
 ```
 
-The instance and its key pair are created once. Later pushes only replace the app files, so the site keeps the same address (unless the instance is stopped/started or the stack is recreated).
+The instance is created once. Later pushes only replace the app files, so the site keeps the same address (unless the instance is stopped/started).
 
-> Your existing `.github/workflows/ci.yml` is unchanged. It still runs the lint/syntax checks and the optional Render deploy hooks. The new workflow deploys to EC2.
+> Your existing `.github/workflows/ci.yml` is unchanged. It still runs the lint/syntax checks and the optional Render deploy hooks.
 
-## 1. Configure AWS Secrets and project settings
+## 1. One-time AWS setup (do this once)
 
-Only the three AWS credentials are kept in GitHub Secrets. Everything else is read from the committed file `.github/deploy-config.env`.
+1. In the AWS console, go to **EC2 → Instances → Launch instance**.
+2. Choose **Amazon Linux 2023**, `t2.micro`, and create/download a **new key pair** (`.pem`).
+3. In the security group, allow:
+   - **SSH (22)** from `0.0.0.0/0` (GitHub runners have no fixed IP; restrict later if you want).
+   - **HTTP (80)** from `0.0.0.0/0`.
+4. Note the **Instance ID** (`i-0123456789abcdef0`) and the region (`us-east-2` for your sandbox).
+5. Store the private key in **SSM Parameter Store** as a SecureString so it never has to be committed or added as a GitHub secret. Run this locally with the AWS CLI configured, or in AWS CloudShell:
 
-**GitHub Secrets** — Settings → Secrets and variables → Actions → Secrets → New repository secret:
+   ```bash
+   aws ssm put-parameter \
+     --name /fernwell/ec2-ssh-key \
+     --type SecureString \
+     --value "$(cat ~/Downloads/your-key.pem)" \
+     --overwrite \
+     --region us-east-2
+   ```
+
+   Replace the path/filename to match yours. The workflow reads this parameter at deploy time.
+
+## 2. Configure GitHub Secrets and project settings
+
+Only the three AWS credentials are kept in GitHub Secrets. Everything else is read from `.github/deploy-config.env`.
+
+**GitHub Secrets** — Settings → Secrets and variables → Actions → Secrets:
 
 | Name | Value | Needed for |
 | --- | --- | --- |
-| `AWS_ACCESS_KEY_ID` | Access Key ID from the AWS Academy sandbox (starts with `ASIA`) | CloudFormation, EC2, SSM |
-| `AWS_SECRET_ACCESS_KEY` | Secret Access Key from the same sandbox | CloudFormation, EC2, SSM |
+| `AWS_ACCESS_KEY_ID` | Access Key ID from the AWS Academy sandbox (starts with `ASIA`) | EC2, SSM |
+| `AWS_SECRET_ACCESS_KEY` | Secret Access Key from the same sandbox | EC2, SSM |
 | `AWS_SESSION_TOKEN` | Session token shown with those temporary keys | Required whenever the access key starts with `ASIA` |
 
-**Project config** — edit `.github/deploy-config.env` and commit it:
+The workflow trims whitespace/newlines from these values before using them.
 
-| Key | Example / default | Purpose |
+**Project config** — `.github/deploy-config.env`:
+
+| Key | Example | Purpose |
 | --- | --- | --- |
-| `AWS_REGION` | `us-east-2` | Region of your sandbox (the provided session token indicates `us-east-2`) |
-| `STACK_NAME` | `fernwell-stack` | CloudFormation stack name |
+| `AWS_REGION` | `us-east-2` | Region of your sandbox and instance |
+| `INSTANCE_ID` | `i-0123456789abcdef0` | Instance created in step 1 |
+| `SSH_KEY_PARAM` | `/fernwell/ec2-ssh-key` | SSM parameter holding the private key |
 | `ADMIN_EMAIL` | `admin@fernwell.com` | Email of the first admin user |
-| `DB_URL` | `mongodb://127.0.0.1:27017/fernwell` | MongoDB connection string (MongoDB is installed on the EC2 instance by the template) |
-| `JWT_SECRET` | output of `openssl rand -hex 32` | Signs login tokens |
-| `ADMIN_PASSWORD` | your chosen password | Password for the first admin user |
+| `DB_URL` | `mongodb://127.0.0.1:27017/fernwell` | MongoDB connection string (MongoDB is installed on the instance) |
+| `JWT_SECRET` | `kul-is-cool` | Signs login tokens |
+| `ADMIN_PASSWORD` | `admin123` | Password for the first admin user |
 
 The workflow refuses to run while any value still says `replace-...`.
 
 Notes:
 
-- AWS Academy sandbox keys are temporary: the access key, secret key, and session token all change together. Start the sandbox and update all three GitHub Secrets together before deploying again. If you paste credentials somewhere public (chat, screenshot, commit), rotate them in the sandbox immediately.
-- `DB_URL`, `JWT_SECRET` and `ADMIN_PASSWORD` are also sensitive. Keeping them in a committed file means anyone with repository access can read them. GitHub Secrets are the safer place; if you change your mind, add those three as secrets and restore the `${{ secrets.NAME }}` references in `.github/workflows/deploy-ec2.yml`.
-- The template installs MongoDB Community Edition on the instance, so the default `mongodb://127.0.0.1:27017/fernwell` works without Atlas. If you switch to Atlas, add the runner's IP to Atlas Network Access (or allow `0.0.0.0/0` for a student project) and update `DB_URL`.
-- The AWS credentials are never written to the repository or the instance.
+- AWS Academy keys are temporary. All three AWS secrets change together when the lab restarts; update them together. Rotate any credentials that appeared in chat.
+- `DB_URL`, `JWT_SECRET` and `ADMIN_PASSWORD` are committed in the repo, so anyone with repository access can read them. GitHub Secrets are safer; if you change your mind, add those three as secrets and restore `${{ secrets.NAME }}` references in the workflow.
+- The private SSH key is **not** in the repo — it lives in SSM. If your sandbox denies `ssm:GetParameter`, put the key in a GitHub secret instead and change the "Get SSH key from SSM" step to write that secret to `ec2-key.pem`.
 
-## 2. Trigger the pipeline
+## 3. Trigger the pipeline
 
-- Push a change to `main` under `backend/`, `frontend/`, `infra/`, or the workflow file, **or**
-- Open **Actions → Deploy MERN app to EC2 → Run workflow** and choose an instance type.
+- Push a change under `backend/`, `frontend/`, `scripts/`, or the workflow/config files, **or**
+- Open **Actions → Deploy MERN app to EC2 → Run workflow**.
 
-The first run takes a few minutes (package installation on a fresh instance). Later runs are faster.
+The first run takes a few minutes while packages install. The run summary shows the site and API URLs. Open `http://<public-ip>` and log in with `admin@fernwell.com` and your `ADMIN_PASSWORD`.
 
-When it finishes, the run summary shows the website URL and the CloudFormation outputs. Open `http://<public-ip>` in a browser and log in as `admin@fernwell.com` with the `ADMIN_PASSWORD` you set.
+## 4. Why there is no API URL to configure
 
-## 3. Why there is no API URL to configure
+The React build uses `VITE_API_URL=/api`. nginx serves the site at `/` and forwards `/api/*` to Express on `127.0.0.1:8000`:
 
-The React build is made with `VITE_API_URL=/api`. nginx serves the site at `/` and forwards `/api/*` to the Express API on `127.0.0.1:8000`. That means:
-
-- No hardcoded public IP in the frontend bundle.
+- No public IP is baked into the frontend bundle.
 - No CORS problem, because the browser sees one origin.
 - A changed public IP after a stop/start still works.
 
-The API is generated with `CLIENT_URL=http://<current-public-ip>` in the instance's `.env` so CORS matches the browser address.
+The API gets `CLIENT_URL=http://<current-public-ip>` in its `.env` so CORS matches the browser address.
 
-## 4. Files added by this pipeline
+## 5. Files in this pipeline
 
 | File | What it does |
 | --- | --- |
 | `.github/workflows/deploy-ec2.yml` | Build + deploy workflow (push to `main` or manual) |
-| `infra/ec2-app.yaml` | CloudFormation: key pair, security group (22/80), EC2 with nginx + Node, systemd unit for the API |
+| `.github/deploy-config.env` | Region, instance ID, SSM key path, MongoDB and admin settings |
+| `scripts/ec2-bootstrap.sh` | One-time server setup: nginx, Node.js, MongoDB, systemd service |
 | `docs/EC2-DEPLOYMENT.md` | This guide |
+| `infra/ec2-app.yaml` | Original CloudFormation template, kept as a reference only — **not used** because the sandbox denies CloudFormation |
 
-Nothing in `backend/` or `frontend/` source was changed, so local development (`npm run dev` in both folders) works exactly as before.
+Nothing in `backend/` or `frontend/` source was changed, so local development still works as before.
 
-## 5. Useful commands
-
-SSH into the instance (from the workflow's `Show outputs` step you can copy the key from SSM; for local SSH use your own key or the AWS console "Connect" button):
+## 6. Useful commands on the instance
 
 ```bash
 sudo systemctl status fernwell-api     # API process
+sudo systemctl status mongod           # Database
 sudo journalctl -u fernwell-api -n 50  # API logs
 sudo tail -f /var/log/nginx/error.log  # nginx errors
 curl http://localhost/api/             # should return {"success":true,...}
 ```
 
-Change app settings by editing `.github/deploy-config.env` and pushing, then run the workflow manually if you want it immediately. Change AWS credentials by updating the three GitHub Secrets and running the workflow manually. The `.env` on the instance is rewritten on every deploy.
+Change app settings by editing `.github/deploy-config.env` and pushing. Change AWS credentials by updating the three GitHub Secrets. The `.env` on the instance is rewritten on every deploy.
 
-Change instance size: run the workflow manually and pick a different `instance_type`, or set the `InstanceType` stack parameter in the CloudFormation console.
-
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 | Symptom | Fix |
 | --- | --- |
-| `Invalid character in header content ["x-amz-security-token"]` | The session token secret contained a hidden newline. The workflow now trims all three AWS secrets automatically; if it still happens, re-create the secret with a single-line paste. |
-| `SignatureDoesNotMatch` / `InvalidClientTokenId` | AWS keys are swapped, have spaces, expired, or the matching `AWS_SESSION_TOKEN` is missing. Copy all three fresh sandbox values together. |
-| Workflow stops at "Check AWS secrets and deploy config" | Fill in the `replace-...` values in `.github/deploy-config.env`, or add the missing AWS secret, then run the workflow again. |
-| `SSH not ready yet ...` for the full loop | Check the security group allows port 22 from GitHub runners, and that the keys belong to the same sandbox account/region. |
-| "UserData failed on the instance" | The log printed in the workflow shows the failing `dnf`/nginx command. Fix the template and re-run. |
-| Site loads but API calls fail / 502 | Read the API logs in the failed step. Usually a bad `DB_URL` or Atlas IP allowlist; fix `.github/deploy-config.env` and re-run. |
-| Site works, then disappears | The sandbox stopped the instance. The next deploy starts it again. A stopped/started instance can get a new IP, so use the latest URL from the workflow summary. |
-| Login fails with the old admin password | `npm run seed` only creates the admin once. Change the password in MongoDB, or delete that admin user and re-run the workflow with a new `ADMIN_PASSWORD`. |
-| Want to stop charges | Delete the `fernwell-stack` stack in CloudFormation. This removes the instance, key pair and security group. |
-
-## 7. Region and stack name
-
-Both are set in `.github/deploy-config.env` (`us-east-2` / `fernwell-stack` by default). If you change `STACK_NAME` after a deploy, the old stack stays running — delete it manually when you no longer need it.
+| `AccessDenied ... cloudformation:ValidateTemplate` | CloudFormation is denied by your sandbox SCP. This workflow no longer calls CloudFormation — make sure you pulled the latest `main`. |
+| `Invalid character in header content ["x-amz-security-token"]` | A hidden newline in the session token secret. The workflow trims it; if it persists, re-create the secret with a single-line paste. |
+| `SignatureDoesNotMatch` / `InvalidClientTokenId` | AWS keys are swapped, expired, or missing the session token. Copy all three fresh sandbox values together. |
+| Workflow stops at "Check AWS secrets and deploy config" | Fill the `replace-...` values in `.github/deploy-config.env` or add the missing AWS secret. |
+| `InvalidInstanceID.NotFound` | The instance ID is wrong or belongs to another region. Check `INSTANCE_ID` and `AWS_REGION`. |
+| `SSH not ready yet ...` for the full loop | Check the security group allows port 22 from GitHub runners, the key in SSM matches the instance's key pair, and the instance is in a public subnet. |
+| Bootstrap fails during `dnf install` | Read the error in the workflow log. Usually a blocked package repo; the sandbox must allow access to `repo.mongodb.org`. |
+| Site loads but API calls fail / 502 | Read the API logs in the failed step. Usually `mongod` is not running or `DB_URL` is wrong. |
+| Site works, then disappears | The sandbox stopped the instance. The next deploy starts it again; a restart can change the IP, so use the latest URL from the workflow summary. |
+| Login fails with the old admin password | `npm run seed` only creates the admin once. Change the password in MongoDB, or delete that admin user and re-run with a new `ADMIN_PASSWORD`. |
+| Want to stop charges | Terminate the EC2 instance in the console and delete the `/fernwell/ec2-ssh-key` SSM parameter. |
